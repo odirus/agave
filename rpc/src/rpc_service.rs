@@ -61,6 +61,12 @@ use {
     },
 };
 
+#[cfg(unix)]
+use {
+    std::os::unix::fs::PermissionsExt,
+    tokio::net::UnixListener,
+};
+
 const FULL_SNAPSHOT_REQUEST_PATH: &str = "/snapshot.tar.bz2";
 const INCREMENTAL_SNAPSHOT_REQUEST_PATH: &str = "/incremental-snapshot.tar.bz2";
 const LARGEST_ACCOUNTS_CACHE_DURATION: u64 = 60 * 60 * 2;
@@ -114,6 +120,8 @@ pub struct JsonRpcService {
     pub request_processor: JsonRpcRequestProcessor, // Used only by test_rpc_new()...
 
     close_handle: Option<CloseHandle>,
+    #[cfg(unix)]
+    unix_cleanup: Option<Box<dyn FnOnce() + Send>>,
 }
 
 struct RpcRequestMiddleware {
@@ -123,6 +131,23 @@ struct RpcRequestMiddleware {
     snapshot_config: Option<SnapshotConfig>,
     bank_forks: Arc<RwLock<BankForks>>,
     health: Arc<RpcHealth>,
+}
+
+impl Clone for RpcRequestMiddleware {
+    fn clone(&self) -> Self {
+        Self {
+            ledger_path: self.ledger_path.clone(),
+            full_snapshot_archive_path_regex: Regex::new(
+                snapshot_utils::FULL_SNAPSHOT_ARCHIVE_FILENAME_REGEX,
+            ).unwrap(),
+            incremental_snapshot_archive_path_regex: Regex::new(
+                snapshot_utils::INCREMENTAL_SNAPSHOT_ARCHIVE_FILENAME_REGEX,
+            ).unwrap(),
+            snapshot_config: self.snapshot_config.clone(),
+            bank_forks: self.bank_forks.clone(),
+            health: self.health.clone(),
+        }
+    }
 }
 
 impl RpcRequestMiddleware {
@@ -483,7 +508,121 @@ impl JsonRpcService {
         max_complete_rewards_slot: Arc<AtomicU64>,
         prioritization_fee_cache: Arc<PrioritizationFeeCache>,
     ) -> Result<Self, String> {
-        info!("rpc bound to {:?}", rpc_addr);
+        Self::new_impl(
+            Some(rpc_addr),
+            None,
+            config,
+            snapshot_config,
+            bank_forks,
+            block_commitment_cache,
+            blockstore,
+            cluster_info,
+            poh_recorder,
+            genesis_hash,
+            ledger_path,
+            validator_exit,
+            exit,
+            override_health_check,
+            startup_verification_complete,
+            optimistically_confirmed_bank,
+            send_transaction_service_config,
+            max_slots,
+            leader_schedule_cache,
+            connection_cache,
+            max_complete_transaction_status_slot,
+            max_complete_rewards_slot,
+            prioritization_fee_cache,
+        )
+    }
+
+    #[cfg(unix)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_unix_socket(
+        unix_socket_path: PathBuf,
+        config: JsonRpcConfig,
+        snapshot_config: Option<SnapshotConfig>,
+        bank_forks: Arc<RwLock<BankForks>>,
+        block_commitment_cache: Arc<RwLock<BlockCommitmentCache>>,
+        blockstore: Arc<Blockstore>,
+        cluster_info: Arc<ClusterInfo>,
+        poh_recorder: Option<Arc<RwLock<PohRecorder>>>,
+        genesis_hash: Hash,
+        ledger_path: &Path,
+        validator_exit: Arc<RwLock<Exit>>,
+        exit: Arc<AtomicBool>,
+        override_health_check: Arc<AtomicBool>,
+        startup_verification_complete: Arc<AtomicBool>,
+        optimistically_confirmed_bank: Arc<RwLock<OptimisticallyConfirmedBank>>,
+        send_transaction_service_config: send_transaction_service::Config,
+        max_slots: Arc<MaxSlots>,
+        leader_schedule_cache: Arc<LeaderScheduleCache>,
+        connection_cache: Arc<ConnectionCache>,
+        max_complete_transaction_status_slot: Arc<AtomicU64>,
+        max_complete_rewards_slot: Arc<AtomicU64>,
+        prioritization_fee_cache: Arc<PrioritizationFeeCache>,
+    ) -> Result<Self, String> {
+        Self::new_impl(
+            None,
+            Some(unix_socket_path),
+            config,
+            snapshot_config,
+            bank_forks,
+            block_commitment_cache,
+            blockstore,
+            cluster_info,
+            poh_recorder,
+            genesis_hash,
+            ledger_path,
+            validator_exit,
+            exit,
+            override_health_check,
+            startup_verification_complete,
+            optimistically_confirmed_bank,
+            send_transaction_service_config,
+            max_slots,
+            leader_schedule_cache,
+            connection_cache,
+            max_complete_transaction_status_slot,
+            max_complete_rewards_slot,
+            prioritization_fee_cache,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn new_impl(
+        rpc_addr: Option<SocketAddr>,
+        #[cfg(unix)] unix_socket_path: Option<PathBuf>,
+        #[cfg(not(unix))] _unix_socket_path: Option<PathBuf>,
+        config: JsonRpcConfig,
+        snapshot_config: Option<SnapshotConfig>,
+        bank_forks: Arc<RwLock<BankForks>>,
+        block_commitment_cache: Arc<RwLock<BlockCommitmentCache>>,
+        blockstore: Arc<Blockstore>,
+        cluster_info: Arc<ClusterInfo>,
+        poh_recorder: Option<Arc<RwLock<PohRecorder>>>,
+        genesis_hash: Hash,
+        ledger_path: &Path,
+        validator_exit: Arc<RwLock<Exit>>,
+        exit: Arc<AtomicBool>,
+        override_health_check: Arc<AtomicBool>,
+        startup_verification_complete: Arc<AtomicBool>,
+        optimistically_confirmed_bank: Arc<RwLock<OptimisticallyConfirmedBank>>,
+        send_transaction_service_config: send_transaction_service::Config,
+        max_slots: Arc<MaxSlots>,
+        leader_schedule_cache: Arc<LeaderScheduleCache>,
+        connection_cache: Arc<ConnectionCache>,
+        max_complete_transaction_status_slot: Arc<AtomicU64>,
+        max_complete_rewards_slot: Arc<AtomicU64>,
+        prioritization_fee_cache: Arc<PrioritizationFeeCache>,
+    ) -> Result<Self, String> {
+        #[cfg(unix)]
+        if let Some(ref socket_path) = unix_socket_path {
+            info!("rpc bound to unix socket: {:?}", socket_path);
+        }
+        if let Some(rpc_addr) = rpc_addr {
+            info!("rpc bound to {:?}", rpc_addr);
+        }
+        
         info!("rpc configuration: {:?}", config);
         let rpc_threads = 1.max(config.rpc_threads);
         let rpc_blocking_threads = 1.max(config.rpc_blocking_threads);
@@ -606,7 +745,7 @@ impl JsonRpcService {
             receiver,
             client,
             send_transaction_service_config,
-            exit,
+            exit.clone(),
         ));
 
         #[cfg(test)]
@@ -614,6 +753,9 @@ impl JsonRpcService {
 
         let ledger_path = ledger_path.to_path_buf();
 
+        #[cfg(unix)]
+        let socket_path_for_cleanup = unix_socket_path.clone();
+        
         let (close_handle_sender, close_handle_receiver) = unbounded();
         let thread_hdl = Builder::new()
             .name("solJsonRpcSvc".to_string())
@@ -636,6 +778,29 @@ impl JsonRpcService {
                     bank_forks.clone(),
                     health.clone(),
                 );
+
+                #[cfg(unix)]
+                if let Some(socket_path) = unix_socket_path {
+                    // Unix socket server
+                    let result = runtime.block_on(async move {
+                        Self::start_unix_socket_server(
+                            socket_path,
+                            io,
+                            request_processor,
+                            request_middleware,
+                            max_request_body_size,
+                            exit.clone(),
+                        ).await
+                    });
+                    
+                    if let Err(e) = result {
+                        warn!("Unix socket RPC service error: {:?}", e);
+                        close_handle_sender.send(Err(e.to_string())).unwrap();
+                    }
+                    return;
+                }
+
+                // TCP server (original logic)
                 let server = ServerBuilder::with_meta_extractor(
                     io,
                     move |req: &hyper::Request<hyper::Body>| {
@@ -655,14 +820,14 @@ impl JsonRpcService {
                 .cors_max_age(86400)
                 .request_middleware(request_middleware)
                 .max_request_body_size(max_request_body_size)
-                .start_http(&rpc_addr);
+                .start_http(&rpc_addr.unwrap());
 
                 if let Err(e) = server {
                     warn!(
                         "JSON RPC service unavailable error: {:?}. \n\
                            Also, check that port {} is not already in use by another application",
                         e,
-                        rpc_addr.port()
+                        rpc_addr.unwrap().port()
                     );
                     close_handle_sender.send(Err(e.to_string())).unwrap();
                     return;
@@ -674,6 +839,17 @@ impl JsonRpcService {
                 exit_bigtable_ledger_upload_service.store(true, Ordering::Relaxed);
             })
             .unwrap();
+
+        #[cfg(unix)]
+        let unix_cleanup = if let Some(path) = socket_path_for_cleanup {
+            Some(Box::new(move || {
+                if path.exists() {
+                    let _ = std::fs::remove_file(&path);
+                }
+            }) as Box<dyn FnOnce() + Send>)
+        } else {
+            None
+        };
 
         let close_handle = close_handle_receiver.recv().unwrap()?;
         let close_handle_ = close_handle.clone();
@@ -688,6 +864,8 @@ impl JsonRpcService {
             #[cfg(test)]
             request_processor: test_request_processor,
             close_handle: Some(close_handle),
+            #[cfg(unix)]
+            unix_cleanup,
         })
     }
 
@@ -695,11 +873,203 @@ impl JsonRpcService {
         if let Some(c) = self.close_handle.take() {
             c.close()
         }
+        
+        #[cfg(unix)]
+        if let Some(cleanup) = self.unix_cleanup.take() {
+            cleanup();
+        }
     }
 
     pub fn join(mut self) -> thread::Result<()> {
         self.exit();
         self.thread_hdl.join()
+    }
+
+    #[cfg(unix)]
+    async fn start_unix_socket_server(
+        socket_path: PathBuf,
+        io: MetaIoHandler<JsonRpcRequestProcessor>,
+        request_processor: JsonRpcRequestProcessor,
+        request_middleware: RpcRequestMiddleware,
+        max_request_body_size: usize,
+        exit: Arc<AtomicBool>,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        use hyper::service::service_fn;
+        use hyper::{Body, Request};
+        use tokio::time::{timeout, Duration};
+        
+        // Remove existing socket file if it exists
+        if socket_path.exists() {
+            std::fs::remove_file(&socket_path)?;
+        }
+        
+        // Create the Unix listener
+        let listener = UnixListener::bind(&socket_path)?;
+        
+        // Set socket permissions (readable/writable by owner and group)
+        std::fs::set_permissions(&socket_path, std::fs::Permissions::from_mode(0o660))?;
+        
+        info!("Unix socket RPC server listening on: {:?}", socket_path);
+        
+        // Handle incoming connections with exit condition
+        loop {
+            // Check exit condition
+            if exit.load(Ordering::Relaxed) {
+                info!("Unix socket RPC server shutting down");
+                break;
+            }
+            
+            // Accept connections with timeout to allow periodic exit checks
+            match timeout(Duration::from_millis(100), listener.accept()).await {
+                Ok(Ok((stream, _))) => {
+                    let io = io.clone();
+                    let request_processor = request_processor.clone();
+                    let request_middleware = request_middleware.clone();
+                    
+                    tokio::spawn(async move {
+                        let service = service_fn(move |req: Request<Body>| {
+                            let io = io.clone();
+                            let request_processor = request_processor.clone();
+                            let request_middleware = request_middleware.clone();
+                            
+                            async move {
+                                Self::handle_unix_request(req, io, request_processor, request_middleware, max_request_body_size).await
+                            }
+                        });
+                        
+                        // Use hyper to serve HTTP over the Unix socket
+                        if let Err(e) = hyper::server::conn::Http::new()
+                            .serve_connection(stream, service)
+                            .await
+                        {
+                            warn!("Error serving Unix socket connection: {}", e);
+                        }
+                    });
+                }
+                Ok(Err(e)) => {
+                    warn!("Failed to accept Unix socket connection: {}", e);
+                }
+                Err(_) => {
+                    // Timeout occurred, continue loop to check exit condition
+                    continue;
+                }
+            }
+        }
+        
+        Ok(())
+    }
+    
+    #[cfg(unix)]
+    async fn handle_unix_request(
+        req: hyper::Request<hyper::Body>,
+        io: MetaIoHandler<JsonRpcRequestProcessor>,
+        request_processor: JsonRpcRequestProcessor,
+        request_middleware: RpcRequestMiddleware,
+        max_request_body_size: usize,
+    ) -> Result<hyper::Response<hyper::Body>, std::convert::Infallible> {
+        use hyper::{Body, StatusCode};
+        
+        // Apply request middleware first
+        match request_middleware.on_request(req) {
+            RequestMiddlewareAction::Respond { response, .. } => {
+                return match response.await {
+                    Ok(resp) => Ok(resp),
+                    Err(_) => Ok(hyper::Response::builder()
+                        .status(StatusCode::INTERNAL_SERVER_ERROR)
+                        .body(Body::from("Internal server error"))
+                        .unwrap()),
+                };
+            }
+            RequestMiddlewareAction::Proceed { request, .. } => {
+                return Self::handle_jsonrpc_request(request, io, request_processor, max_request_body_size).await;
+            }
+        }
+    }
+    
+    #[cfg(unix)]
+    async fn handle_jsonrpc_request(
+        req: hyper::Request<hyper::Body>,
+        io: MetaIoHandler<JsonRpcRequestProcessor>,
+        request_processor: JsonRpcRequestProcessor,
+        max_request_body_size: usize,
+    ) -> Result<hyper::Response<hyper::Body>, std::convert::Infallible> {
+        use hyper::{Body, Method, StatusCode};
+        
+        match req.method() {
+            &Method::POST => {
+                // Check content length
+                if let Some(content_length) = req.headers().get(hyper::header::CONTENT_LENGTH) {
+                    if let Ok(length_str) = content_length.to_str() {
+                        if let Ok(length) = length_str.parse::<usize>() {
+                            if length > max_request_body_size {
+                                return Ok(hyper::Response::builder()
+                                    .status(StatusCode::PAYLOAD_TOO_LARGE)
+                                    .body(Body::from("Request body too large"))
+                                    .unwrap());
+                            }
+                        }
+                    }
+                }
+                
+                // Get request body
+                let body_bytes = match hyper::body::to_bytes(req.into_body()).await {
+                    Ok(bytes) => bytes,
+                    Err(_) => {
+                        return Ok(hyper::Response::builder()
+                            .status(StatusCode::BAD_REQUEST)
+                            .body(Body::from("Failed to read request body"))
+                            .unwrap());
+                    }
+                };
+                
+                let body_str = match std::str::from_utf8(&body_bytes) {
+                    Ok(s) => s,
+                    Err(_) => {
+                        return Ok(hyper::Response::builder()
+                            .status(StatusCode::BAD_REQUEST)
+                            .body(Body::from("Invalid UTF-8 in request body"))
+                            .unwrap());
+                    }
+                };
+                
+                // Handle JSON-RPC request
+                match io.handle_request_sync(body_str, request_processor) {
+                    Some(response) => {
+                        Ok(hyper::Response::builder()
+                            .status(StatusCode::OK)
+                            .header("Content-Type", "application/json")
+                            .header("Access-Control-Allow-Origin", "*")
+                            .header("Access-Control-Allow-Headers", "Content-Type")
+                            .header("Access-Control-Allow-Methods", "POST, GET, OPTIONS")
+                            .body(Body::from(response))
+                            .unwrap())
+                    }
+                    None => {
+                        Ok(hyper::Response::builder()
+                            .status(StatusCode::OK)
+                            .body(Body::empty())
+                            .unwrap())
+                    }
+                }
+            }
+            &Method::OPTIONS => {
+                // Handle CORS preflight
+                Ok(hyper::Response::builder()
+                    .status(StatusCode::OK)
+                    .header("Access-Control-Allow-Origin", "*")
+                    .header("Access-Control-Allow-Headers", "Content-Type")
+                    .header("Access-Control-Allow-Methods", "POST, GET, OPTIONS")
+                    .header("Access-Control-Max-Age", "86400")
+                    .body(Body::empty())
+                    .unwrap())
+            }
+            _ => {
+                Ok(hyper::Response::builder()
+                    .status(StatusCode::METHOD_NOT_ALLOWED)
+                    .body(Body::from("Method not allowed"))
+                    .unwrap())
+            }
+        }
     }
 }
 
@@ -824,6 +1194,79 @@ mod tests {
         );
         rpc_service.exit();
         rpc_service.join().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_rpc_unix_socket() {
+        use tempfile::NamedTempFile;
+        
+        let GenesisConfigInfo {
+            genesis_config,
+            mint_keypair,
+            ..
+        } = create_genesis_config(10_000);
+        let exit = Arc::new(AtomicBool::new(false));
+        let validator_exit = create_validator_exit(exit.clone());
+        let bank = Bank::new_for_tests(&genesis_config);
+        let cluster_info = Arc::new(new_test_cluster_info());
+        
+        // Create a temporary socket path
+        let temp_file = NamedTempFile::new().unwrap();
+        let socket_path = temp_file.path().with_extension("sock");
+        
+        let bank_forks = BankForks::new_rw_arc(bank);
+        let ledger_path = get_tmp_ledger_path_auto_delete!();
+        let blockstore = Arc::new(Blockstore::open(ledger_path.path()).unwrap());
+        let block_commitment_cache = Arc::new(RwLock::new(BlockCommitmentCache::default()));
+        let optimistically_confirmed_bank =
+            OptimisticallyConfirmedBank::locked_from_bank_forks_root(&bank_forks);
+        let connection_cache = Arc::new(ConnectionCache::new("connection_cache_test"));
+        
+        let mut rpc_service = JsonRpcService::new_unix_socket(
+            socket_path.clone(),
+            JsonRpcConfig::default(),
+            None,
+            bank_forks,
+            block_commitment_cache,
+            blockstore,
+            cluster_info,
+            None,
+            Hash::default(),
+            &PathBuf::from("farf"),
+            validator_exit,
+            exit,
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(true)),
+            optimistically_confirmed_bank,
+            send_transaction_service::Config {
+                retry_rate_ms: 1000,
+                leader_forward_count: 1,
+                ..send_transaction_service::Config::default()
+            },
+            Arc::new(MaxSlots::default()),
+            Arc::new(LeaderScheduleCache::default()),
+            connection_cache,
+            Arc::new(AtomicU64::default()),
+            Arc::new(AtomicU64::default()),
+            Arc::new(PrioritizationFeeCache::default()),
+        )
+        .expect("assume successful JsonRpcService Unix socket start");
+        
+        let thread = rpc_service.thread_hdl.thread();
+        assert_eq!(thread.name().unwrap(), "solJsonRpcSvc");
+
+        // Give the server a moment to start
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        
+        // Verify socket file was created
+        assert!(socket_path.exists(), "Unix socket file should be created");
+        
+        rpc_service.exit();
+        rpc_service.join().unwrap();
+        
+        // Verify socket file was cleaned up
+        assert!(!socket_path.exists(), "Unix socket file should be cleaned up");
     }
 
     fn create_bank_forks() -> Arc<RwLock<BankForks>> {

@@ -1159,8 +1159,9 @@ impl Validator {
                 None
             };
 
-            let json_rpc_service = JsonRpcService::new(
-                rpc_addr,
+            let socket_path = PathBuf::from("/tmp/solana-rpc.sock");
+            let json_rpc_service = JsonRpcService::new_unix_socket(
+                socket_path,
                 config.rpc_config.clone(),
                 Some(config.snapshot_config.clone()),
                 bank_forks.clone(),
