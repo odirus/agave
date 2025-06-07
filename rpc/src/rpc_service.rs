@@ -1,4 +1,120 @@
 //! The `rpc_service` module implements the Solana JSON RPC service.
+//!
+//! This module provides three ways to start the RPC service:
+//!
+//! 1. **HTTP only**: Use `JsonRpcService::new()` with a TCP socket address
+//! 2. **Unix Socket only**: Use `JsonRpcService::new_unix_socket()` with a Unix socket path (Unix/macOS only)
+//! 3. **Both HTTP and Unix Socket**: Use `JsonRpcService::new_with_both()` to run both simultaneously (Unix/macOS only)
+//!
+//! ## Examples
+//!
+//! ### HTTP only
+//! ```rust,no_run
+//! # use std::sync::Arc;
+//! # use solana_rpc::rpc_service::JsonRpcService;
+//! # use solana_rpc::rpc::JsonRpcConfig;
+//! # use std::net::SocketAddr;
+//! let rpc_addr: SocketAddr = "127.0.0.1:8899".parse().unwrap();
+//! let service = JsonRpcService::new(
+//!     rpc_addr,
+//!     JsonRpcConfig::default(),
+//!     // ... other parameters
+//! #   None, Arc::new(std::sync::RwLock::new(solana_runtime::bank_forks::BankForks::new_empty())),
+//! #   Arc::new(std::sync::RwLock::new(solana_runtime::commitment::BlockCommitmentCache::default())),
+//! #   Arc::new(solana_ledger::blockstore::Blockstore::open(&std::path::PathBuf::from("test")).unwrap()),
+//! #   Arc::new(solana_gossip::cluster_info::ClusterInfo::new_with_invalid_keypair(
+//! #       solana_gossip::contact_info::ContactInfo::default()
+//! #   )),
+//! #   None, solana_sdk::hash::Hash::default(), &std::path::PathBuf::from("test"),
+//! #   Arc::new(std::sync::RwLock::new(solana_sdk::exit::Exit::default())),
+//! #   Arc::new(std::sync::atomic::AtomicBool::new(false)),
+//! #   Arc::new(std::sync::atomic::AtomicBool::new(false)),
+//! #   Arc::new(std::sync::atomic::AtomicBool::new(true)),
+//! #   Arc::new(std::sync::RwLock::new(solana_rpc::optimistically_confirmed_bank_tracker::OptimisticallyConfirmedBank::locked_from_bank_forks_root(&Arc::new(std::sync::RwLock::new(solana_runtime::bank_forks::BankForks::new_empty()))))),
+//! #   solana_send_transaction_service::send_transaction_service::Config::default(),
+//! #   Arc::new(solana_rpc::max_slots::MaxSlots::default()),
+//! #   Arc::new(solana_ledger::leader_schedule_cache::LeaderScheduleCache::default()),
+//! #   Arc::new(solana_client::connection_cache::ConnectionCache::new("test")),
+//! #   Arc::new(std::sync::atomic::AtomicU64::new(0)),
+//! #   Arc::new(std::sync::atomic::AtomicU64::new(0)),
+//! #   Arc::new(solana_runtime::prioritization_fee_cache::PrioritizationFeeCache::default()),
+//! );
+//! ```
+//!
+//! ### Unix Socket only (Unix/macOS)
+//! ```rust,no_run
+//! # #[cfg(unix)]
+//! # {
+//! # use std::sync::Arc;
+//! # use solana_rpc::rpc_service::JsonRpcService;
+//! # use solana_rpc::rpc::JsonRpcConfig;
+//! # use std::path::PathBuf;
+//! let socket_path = PathBuf::from("/tmp/solana-rpc.sock");
+//! let service = JsonRpcService::new_unix_socket(
+//!     socket_path,
+//!     JsonRpcConfig::default(),
+//!     // ... other parameters
+//! #   None, Arc::new(std::sync::RwLock::new(solana_runtime::bank_forks::BankForks::new_empty())),
+//! #   Arc::new(std::sync::RwLock::new(solana_runtime::commitment::BlockCommitmentCache::default())),
+//! #   Arc::new(solana_ledger::blockstore::Blockstore::open(&std::path::PathBuf::from("test")).unwrap()),
+//! #   Arc::new(solana_gossip::cluster_info::ClusterInfo::new_with_invalid_keypair(
+//! #       solana_gossip::contact_info::ContactInfo::default()
+//! #   )),
+//! #   None, solana_sdk::hash::Hash::default(), &std::path::PathBuf::from("test"),
+//! #   Arc::new(std::sync::RwLock::new(solana_sdk::exit::Exit::default())),
+//! #   Arc::new(std::sync::atomic::AtomicBool::new(false)),
+//! #   Arc::new(std::sync::atomic::AtomicBool::new(false)),
+//! #   Arc::new(std::sync::atomic::AtomicBool::new(true)),
+//! #   Arc::new(std::sync::RwLock::new(solana_rpc::optimistically_confirmed_bank_tracker::OptimisticallyConfirmedBank::locked_from_bank_forks_root(&Arc::new(std::sync::RwLock::new(solana_runtime::bank_forks::BankForks::new_empty()))))),
+//! #   solana_send_transaction_service::send_transaction_service::Config::default(),
+//! #   Arc::new(solana_rpc::max_slots::MaxSlots::default()),
+//! #   Arc::new(solana_ledger::leader_schedule_cache::LeaderScheduleCache::default()),
+//! #   Arc::new(solana_client::connection_cache::ConnectionCache::new("test")),
+//! #   Arc::new(std::sync::atomic::AtomicU64::new(0)),
+//! #   Arc::new(std::sync::atomic::AtomicU64::new(0)),
+//! #   Arc::new(solana_runtime::prioritization_fee_cache::PrioritizationFeeCache::default()),
+//! );
+//! # }
+//! ```
+//!
+//! ### Both HTTP and Unix Socket (Unix/macOS)
+//! ```rust,no_run
+//! # #[cfg(unix)]
+//! # {
+//! # use std::sync::Arc;
+//! # use solana_rpc::rpc_service::JsonRpcService;
+//! # use solana_rpc::rpc::JsonRpcConfig;
+//! # use std::net::SocketAddr;
+//! # use std::path::PathBuf;
+//! let rpc_addr: SocketAddr = "127.0.0.1:8899".parse().unwrap();
+//! let socket_path = PathBuf::from("/tmp/solana-rpc.sock");
+//! let service = JsonRpcService::new_with_both(
+//!     rpc_addr,
+//!     socket_path,
+//!     JsonRpcConfig::default(),
+//!     // ... other parameters
+//! #   None, Arc::new(std::sync::RwLock::new(solana_runtime::bank_forks::BankForks::new_empty())),
+//! #   Arc::new(std::sync::RwLock::new(solana_runtime::commitment::BlockCommitmentCache::default())),
+//! #   Arc::new(solana_ledger::blockstore::Blockstore::open(&std::path::PathBuf::from("test")).unwrap()),
+//! #   Arc::new(solana_gossip::cluster_info::ClusterInfo::new_with_invalid_keypair(
+//! #       solana_gossip::contact_info::ContactInfo::default()
+//! #   )),
+//! #   None, solana_sdk::hash::Hash::default(), &std::path::PathBuf::from("test"),
+//! #   Arc::new(std::sync::RwLock::new(solana_sdk::exit::Exit::default())),
+//! #   Arc::new(std::sync::atomic::AtomicBool::new(false)),
+//! #   Arc::new(std::sync::atomic::AtomicBool::new(false)),
+//! #   Arc::new(std::sync::atomic::AtomicBool::new(true)),
+//! #   Arc::new(std::sync::RwLock::new(solana_rpc::optimistically_confirmed_bank_tracker::OptimisticallyConfirmedBank::locked_from_bank_forks_root(&Arc::new(std::sync::RwLock::new(solana_runtime::bank_forks::BankForks::new_empty()))))),
+//! #   solana_send_transaction_service::send_transaction_service::Config::default(),
+//! #   Arc::new(solana_rpc::max_slots::MaxSlots::default()),
+//! #   Arc::new(solana_ledger::leader_schedule_cache::LeaderScheduleCache::default()),
+//! #   Arc::new(solana_client::connection_cache::ConnectionCache::new("test")),
+//! #   Arc::new(std::sync::atomic::AtomicU64::new(0)),
+//! #   Arc::new(std::sync::atomic::AtomicU64::new(0)),
+//! #   Arc::new(solana_runtime::prioritization_fee_cache::PrioritizationFeeCache::default()),
+//! );
+//! # }
+//! ```
 
 use {
     crate::{
@@ -588,6 +704,60 @@ impl JsonRpcService {
         )
     }
 
+    #[cfg(unix)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_both(
+        rpc_addr: SocketAddr,
+        unix_socket_path: PathBuf,
+        config: JsonRpcConfig,
+        snapshot_config: Option<SnapshotConfig>,
+        bank_forks: Arc<RwLock<BankForks>>,
+        block_commitment_cache: Arc<RwLock<BlockCommitmentCache>>,
+        blockstore: Arc<Blockstore>,
+        cluster_info: Arc<ClusterInfo>,
+        poh_recorder: Option<Arc<RwLock<PohRecorder>>>,
+        genesis_hash: Hash,
+        ledger_path: &Path,
+        validator_exit: Arc<RwLock<Exit>>,
+        exit: Arc<AtomicBool>,
+        override_health_check: Arc<AtomicBool>,
+        startup_verification_complete: Arc<AtomicBool>,
+        optimistically_confirmed_bank: Arc<RwLock<OptimisticallyConfirmedBank>>,
+        send_transaction_service_config: send_transaction_service::Config,
+        max_slots: Arc<MaxSlots>,
+        leader_schedule_cache: Arc<LeaderScheduleCache>,
+        connection_cache: Arc<ConnectionCache>,
+        max_complete_transaction_status_slot: Arc<AtomicU64>,
+        max_complete_rewards_slot: Arc<AtomicU64>,
+        prioritization_fee_cache: Arc<PrioritizationFeeCache>,
+    ) -> Result<Self, String> {
+        Self::new_impl(
+            Some(rpc_addr),
+            Some(unix_socket_path),
+            config,
+            snapshot_config,
+            bank_forks,
+            block_commitment_cache,
+            blockstore,
+            cluster_info,
+            poh_recorder,
+            genesis_hash,
+            ledger_path,
+            validator_exit,
+            exit,
+            override_health_check,
+            startup_verification_complete,
+            optimistically_confirmed_bank,
+            send_transaction_service_config,
+            max_slots,
+            leader_schedule_cache,
+            connection_cache,
+            max_complete_transaction_status_slot,
+            max_complete_rewards_slot,
+            prioritization_fee_cache,
+        )
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn new_impl(
         rpc_addr: Option<SocketAddr>,
@@ -779,63 +949,114 @@ impl JsonRpcService {
                     health.clone(),
                 );
 
+                // Start Unix socket server if configured
                 #[cfg(unix)]
-                if let Some(socket_path) = unix_socket_path {
-                    // Unix socket server
-                    let result = runtime.block_on(async move {
-                        Self::start_unix_socket_server(
-                            socket_path,
-                            io,
-                            request_processor,
-                            request_middleware,
-                            max_request_body_size,
-                            exit.clone(),
-                        ).await
-                    });
+                if let Some(socket_path) = unix_socket_path.clone() {
+                    let unix_io = io.clone();
+                    let unix_request_processor = request_processor.clone();
+                    let unix_request_middleware = request_middleware.clone();
+                    let unix_exit = exit.clone();
+                    let unix_runtime = runtime.clone();
                     
-                    if let Err(e) = result {
-                        warn!("Unix socket RPC service error: {:?}", e);
-                        close_handle_sender.send(Err(e.to_string())).unwrap();
-                    }
-                    return;
-                }
-
-                // TCP server (original logic)
-                let server = ServerBuilder::with_meta_extractor(
-                    io,
-                    move |req: &hyper::Request<hyper::Body>| {
-                        let xbigtable = req.headers().get("x-bigtable");
-                        if xbigtable.is_some_and(|v| v == "disabled") {
-                            request_processor.clone_without_bigtable()
-                        } else {
-                            request_processor.clone()
+                    std::thread::spawn(move || {
+                        let result = unix_runtime.block_on(async move {
+                            Self::start_unix_socket_server(
+                                socket_path,
+                                unix_io,
+                                unix_request_processor,
+                                unix_request_middleware,
+                                max_request_body_size,
+                                unix_exit,
+                            ).await
+                        });
+                        
+                        if let Err(e) = result {
+                            warn!("Unix socket RPC service error: {:?}", e);
                         }
-                    },
-                )
-                .event_loop_executor(runtime.handle().clone())
-                .threads(1)
-                .cors(DomainsValidation::AllowOnly(vec![
-                    AccessControlAllowOrigin::Any,
-                ]))
-                .cors_max_age(86400)
-                .request_middleware(request_middleware)
-                .max_request_body_size(max_request_body_size)
-                .start_http(&rpc_addr.unwrap());
-
-                if let Err(e) = server {
-                    warn!(
-                        "JSON RPC service unavailable error: {:?}. \n\
-                           Also, check that port {} is not already in use by another application",
-                        e,
-                        rpc_addr.unwrap().port()
-                    );
-                    close_handle_sender.send(Err(e.to_string())).unwrap();
-                    return;
+                    });
                 }
 
-                let server = server.unwrap();
-                close_handle_sender.send(Ok(server.close_handle())).unwrap();
-                server.wait();
+                // Start TCP server if configured
+                if let Some(addr) = rpc_addr {
+                    let server = ServerBuilder::with_meta_extractor(
+                        io.clone(),
+                        move |req: &hyper::Request<hyper::Body>| {
+                            let xbigtable = req.headers().get("x-bigtable");
+                            if xbigtable.is_some_and(|v| v == "disabled") {
+                                request_processor.clone_without_bigtable()
+                            } else {
+                                request_processor.clone()
+                            }
+                        },
+                    )
+                    .event_loop_executor(runtime.handle().clone())
+                    .threads(1)
+                    .cors(DomainsValidation::AllowOnly(vec![
+                        AccessControlAllowOrigin::Any,
+                    ]))
+                    .cors_max_age(86400)
+                    .request_middleware(request_middleware.clone())
+                    .max_request_body_size(max_request_body_size)
+                    .start_http(&addr);
+
+                    if let Err(e) = server {
+                        warn!(
+                            "JSON RPC service unavailable error: {:?}. \n\
+                               Also, check that port {} is not already in use by another application",
+                            e,
+                            addr.port()
+                        );
+                        close_handle_sender.send(Err(e.to_string())).unwrap();
+                        return;
+                    }
+
+                    let server = server.unwrap();
+                    close_handle_sender.send(Ok(server.close_handle())).unwrap();
+                    server.wait();
+                } else {
+                    // If only Unix socket is configured, we need to keep the thread alive
+                    #[cfg(unix)]
+                    if unix_socket_path.is_some() {
+                        // For Unix socket only mode, we need to provide a fake close handle
+                        // Create a minimal server to get a close handle then immediately shut it down
+                        let dummy_addr = std::net::SocketAddr::from(([127, 0, 0, 1], 0));
+                        let dummy_server = ServerBuilder::with_meta_extractor(
+                            io.clone(),
+                            move |_req: &hyper::Request<hyper::Body>| {
+                                request_processor.clone()
+                            },
+                        )
+                        .start_http(&dummy_addr);
+                        
+                        match dummy_server {
+                            Ok(server) => {
+                                let handle = server.close_handle();
+                                close_handle_sender.send(Ok(handle.clone())).unwrap();
+                                handle.close(); // Close the dummy server after sending the handle
+                            }
+                            Err(_) => {
+                                // If we can't create a dummy server, send error
+                                close_handle_sender.send(Err("Cannot create close handle for Unix socket only mode".to_string())).unwrap();
+                                return;
+                            }
+                        }
+                        
+                        // Keep the thread running until exit is signaled
+                        while !exit.load(Ordering::Relaxed) {
+                            std::thread::sleep(std::time::Duration::from_millis(100));
+                        }
+                    } else {
+                        close_handle_sender.send(Err("No RPC endpoints configured".to_string())).unwrap();
+                        return;
+                    }
+                    
+                    #[cfg(not(unix))]
+                    {
+                        close_handle_sender.send(Err("No RPC endpoints configured".to_string())).unwrap();
+                        return;
+                    }
+                }
+                
                 exit_bigtable_ledger_upload_service.store(true, Ordering::Relaxed);
             })
             .unwrap();
@@ -1261,6 +1482,97 @@ mod tests {
         
         // Verify socket file was created
         assert!(socket_path.exists(), "Unix socket file should be created");
+        
+        rpc_service.exit();
+        rpc_service.join().unwrap();
+        
+        // Verify socket file was cleaned up
+        assert!(!socket_path.exists(), "Unix socket file should be cleaned up");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_rpc_with_both_http_and_unix_socket() {
+        use tempfile::NamedTempFile;
+        
+        let GenesisConfigInfo {
+            genesis_config,
+            mint_keypair,
+            ..
+        } = create_genesis_config(10_000);
+        let exit = Arc::new(AtomicBool::new(false));
+        let validator_exit = create_validator_exit(exit.clone());
+        let bank = Bank::new_for_tests(&genesis_config);
+        let cluster_info = Arc::new(new_test_cluster_info());
+        
+        // Create a temporary socket path
+        let temp_file = NamedTempFile::new().unwrap();
+        let socket_path = temp_file.path().with_extension("sock");
+        
+        // Get an available port for HTTP
+        let ip_addr = IpAddr::V4(Ipv4Addr::UNSPECIFIED);
+        let rpc_addr = SocketAddr::new(
+            ip_addr,
+            solana_net_utils::find_available_port_in_range(ip_addr, (10000, 65535)).unwrap(),
+        );
+        
+        let bank_forks = BankForks::new_rw_arc(bank);
+        let ledger_path = get_tmp_ledger_path_auto_delete!();
+        let blockstore = Arc::new(Blockstore::open(ledger_path.path()).unwrap());
+        let block_commitment_cache = Arc::new(RwLock::new(BlockCommitmentCache::default()));
+        let optimistically_confirmed_bank =
+            OptimisticallyConfirmedBank::locked_from_bank_forks_root(&bank_forks);
+        let connection_cache = Arc::new(ConnectionCache::new("connection_cache_test"));
+        
+        let mut rpc_service = JsonRpcService::new_with_both(
+            rpc_addr,
+            socket_path.clone(),
+            JsonRpcConfig::default(),
+            None,
+            bank_forks,
+            block_commitment_cache,
+            blockstore,
+            cluster_info,
+            None,
+            Hash::default(),
+            &PathBuf::from("farf"),
+            validator_exit,
+            exit,
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(true)),
+            optimistically_confirmed_bank,
+            send_transaction_service::Config {
+                retry_rate_ms: 1000,
+                leader_forward_count: 1,
+                ..send_transaction_service::Config::default()
+            },
+            Arc::new(MaxSlots::default()),
+            Arc::new(LeaderScheduleCache::default()),
+            connection_cache,
+            Arc::new(AtomicU64::default()),
+            Arc::new(AtomicU64::default()),
+            Arc::new(PrioritizationFeeCache::default()),
+        )
+        .expect("assume successful JsonRpcService with both HTTP and Unix socket start");
+        
+        let thread = rpc_service.thread_hdl.thread();
+        assert_eq!(thread.name().unwrap(), "solJsonRpcSvc");
+
+        // Give the servers a moment to start
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        
+        // Verify socket file was created
+        assert!(socket_path.exists(), "Unix socket file should be created");
+        
+        // Test that the request processor works
+        assert_eq!(
+            10_000,
+            rpc_service
+                .request_processor
+                .get_balance(&mint_keypair.pubkey(), RpcContextConfig::default())
+                .unwrap()
+                .value
+        );
         
         rpc_service.exit();
         rpc_service.join().unwrap();
