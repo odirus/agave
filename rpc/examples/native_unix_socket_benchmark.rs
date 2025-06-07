@@ -269,9 +269,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     
     // 测试不同的 RPC 方法
     let test_cases = vec![
-        ("getHealth", json!([])),
-        ("getVersion", json!([])),
-        ("getSlot", json!([])),
+        ("getBalance", json!([
+            "DttWaMuVvTiduZRnguLF7jNxTgiMBZ1hyAumKUiL2KRL",
+            {
+                "encoding": "base64"
+            }
+        ])),
+        ("getAccountInfo", json!([
+            "5BJpnniJB9rGPYXrv3k3RvdcUbPbqkbkXNWUefCkwKi",
+            {
+                "encoding": "base64"
+            }
+        ])),
     ];
     
     let iterations = 100; // 增加测试次数以获得更准确的统计
