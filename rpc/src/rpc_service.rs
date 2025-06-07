@@ -171,7 +171,7 @@ use {
         thread::{self, Builder, JoinHandle},
         time::{Duration, Instant},
     },
-    tokio_util::{
+            tokio_util::{
         bytes::Bytes,
         codec::{BytesCodec, FramedRead},
     },
@@ -785,6 +785,17 @@ impl JsonRpcService {
         max_complete_rewards_slot: Arc<AtomicU64>,
         prioritization_fee_cache: Arc<PrioritizationFeeCache>,
     ) -> Result<Self, String> {
+        // Validate configuration - we expect both HTTP and Unix socket to be provided
+        #[cfg(unix)]
+        if rpc_addr.is_none() || unix_socket_path.is_none() {
+            return Err("Both HTTP address and Unix socket path must be provided for optimal RPC service configuration".to_string());
+        }
+        
+        #[cfg(not(unix))]
+        if rpc_addr.is_none() {
+            return Err("HTTP address must be provided for RPC service".to_string());
+        }
+        
         #[cfg(unix)]
         if let Some(ref socket_path) = unix_socket_path {
             info!("rpc bound to unix socket: {:?}", socket_path);
@@ -960,21 +971,27 @@ impl JsonRpcService {
                     let unix_exit = exit_for_service.clone();
                     let unix_runtime = runtime.clone();
                     
-                    // Start Native Unix Socket server
-                    std::thread::spawn(move || {
-                        let result = unix_runtime.block_on(async move {
-                            Self::start_native_unix_socket_server(
-                                socket_path,
-                                unix_io,
-                                unix_request_processor,
-                                unix_exit,
-                            ).await
-                        });
-                        
-                        if let Err(e) = result {
-                            warn!("Native Unix socket RPC service error: {:?}", e);
-                        }
-                    });
+                    // Start Native Unix Socket server with dedicated thread pool
+                    Builder::new()
+                        .name("solUnixRpcSvc".to_string())
+                        .spawn(move || {
+                            renice_this_thread(rpc_niceness_adj).unwrap();
+                            
+                            let result = unix_runtime.block_on(async move {
+                                Self::start_native_unix_socket_server(
+                                    socket_path,
+                                    unix_io,
+                                    unix_request_processor,
+                                    unix_exit,
+                                    rpc_threads, // Pass thread count for connection pool
+                                ).await
+                            });
+                            
+                            if let Err(e) = result {
+                                warn!("Native Unix socket RPC service error: {:?}", e);
+                            }
+                        })
+                        .unwrap();
                 }
 
                 // Start TCP server if configured
@@ -1015,45 +1032,10 @@ impl JsonRpcService {
                     close_handle_sender.send(Ok(server.close_handle())).unwrap();
                     server.wait();
                 } else {
-                    // If only Unix socket is configured, create a minimal close handle and keep the thread alive
-                    #[cfg(unix)]
-                    if unix_socket_path.is_some() {
-                        // For Unix socket only mode, create a minimal dummy server just to get a close handle
-                        let dummy_addr = std::net::SocketAddr::from(([127, 0, 0, 1], 0));
-                        let dummy_server = ServerBuilder::with_meta_extractor(
-                            io.clone(),
-                            move |_req: &hyper::Request<hyper::Body>| {
-                                request_processor.clone()
-                            },
-                        )
-                        .start_http(&dummy_addr);
-                        
-                        match dummy_server {
-                            Ok(server) => {
-                                let handle = server.close_handle();
-                                close_handle_sender.send(Ok(handle)).unwrap();
-                                // Keep the server running but close it when exit is signaled
-                                while !exit_for_service.load(Ordering::Relaxed) {
-                                    std::thread::sleep(std::time::Duration::from_millis(100));
-                                }
-                                server.close();
-                            }
-                            Err(_) => {
-                                // If we can't create a dummy server, send error
-                                close_handle_sender.send(Err("Cannot create close handle for Unix socket only mode".to_string())).unwrap();
-                                return;
-                            }
-                        }
-                    } else {
-                        close_handle_sender.send(Err("No RPC endpoints configured".to_string())).unwrap();
-                        return;
-                    }
-                    
-                    #[cfg(not(unix))]
-                    {
-                        close_handle_sender.send(Err("No RPC endpoints configured".to_string())).unwrap();
-                        return;
-                    }
+                    // If no HTTP address is configured, this is an invalid configuration
+                    error!("Invalid RPC configuration: HTTP address is required when using RPC service");
+                    close_handle_sender.send(Err("HTTP address is required for RPC service".to_string())).unwrap();
+                    return;
                 }
                 
                 exit_bigtable_ledger_upload_service.store(true, Ordering::Relaxed);
@@ -1118,6 +1100,7 @@ impl JsonRpcService {
         io: MetaIoHandler<JsonRpcRequestProcessor>,
         request_processor: JsonRpcRequestProcessor,
         exit: Arc<AtomicBool>,
+        thread_count: usize,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         use tokio::net::UnixListener;
         use tokio::time::{timeout, Duration};
@@ -1133,13 +1116,17 @@ impl JsonRpcService {
         // Set socket permissions (readable/writable by owner and group)
         std::fs::set_permissions(&socket_path, std::fs::Permissions::from_mode(0o660))?;
         
-        info!("Native Unix socket RPC server listening on: {:?}", socket_path);
+        // Create a semaphore to limit concurrent connections
+        let max_connections = std::cmp::max(thread_count * 8, 64); // Ensure at least 64 concurrent connections
+        let connection_semaphore = Arc::new(tokio::sync::Semaphore::new(max_connections));
+        
+        info!("[UDS-RPC] Native Unix socket RPC server listening on: {:?} with {} threads, max {} concurrent connections", socket_path, thread_count, max_connections);
         
         // Handle incoming connections with exit condition
         loop {
             // Check exit condition
             if exit.load(Ordering::Relaxed) {
-                info!("Native Unix socket RPC server shutting down");
+                info!("[UDS-RPC] Native Unix socket RPC server shutting down");
                 break;
             }
             
@@ -1148,53 +1135,66 @@ impl JsonRpcService {
                 Ok(Ok((mut stream, _))) => {
                     let io = io.clone();
                     let request_processor = request_processor.clone();
+                    let semaphore = connection_semaphore.clone();
                     
+                    // Spawn task to handle connection with semaphore control
                     tokio::spawn(async move {
-                        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                        let _permit = match semaphore.acquire().await {
+                            Ok(permit) => permit,
+                            Err(_) => {
+                                warn!("[UDS-RPC] Semaphore closed, dropping connection");
+                                return;
+                            }
+                        };
+                        use tokio::io::{AsyncWriteExt, BufReader, BufWriter, AsyncBufReadExt};
                         
-                        let mut buffer = [0; 4096];
-                        let mut accumulated_data = String::new();
+                        // Use buffered I/O for better performance
+                        let (reader, writer) = stream.split();
+                        let mut buf_reader = BufReader::new(reader);
+                        let mut buf_writer = BufWriter::new(writer);
+                        let mut line = String::new();
                         
                         loop {
-                            match stream.read(&mut buffer).await {
+                            line.clear();
+                            match buf_reader.read_line(&mut line).await {
                                 Ok(0) => break, // EOF
-                                Ok(n) => {
-                                    let data = String::from_utf8_lossy(&buffer[..n]);
-                                    accumulated_data.push_str(&data);
+                                Ok(_) => {
+                                    let request = line.trim();
+                                    if request.is_empty() {
+                                        continue;
+                                    }
                                     
-                                    // Process complete lines
-                                    while let Some(newline_pos) = accumulated_data.find('\n') {
-                                        let line = accumulated_data[..newline_pos].trim().to_string();
-                                        accumulated_data.drain(..=newline_pos);
-                                        
-                                        if line.is_empty() {
-                                            continue;
-                                        }
-                                        
-                                        // Process JSON-RPC request directly
-                                        match io.handle_request_sync(&line, request_processor.clone()) {
-                                            Some(response) => {
-                                                if let Err(e) = stream.write_all(response.as_bytes()).await {
-                                                    warn!("Failed to write response: {}", e);
-                                                    return;
-                                                }
-                                                if let Err(e) = stream.write_all(b"\n").await {
-                                                    warn!("Failed to write newline: {}", e);
-                                                    return;
-                                                }
+                                    info!("[UDS-RPC] Processing Unix socket request: {}", request);
+                                    
+                                    // Process JSON-RPC request directly with better error handling
+                                    match io.handle_request_sync(request, request_processor.clone()) {
+                                        Some(response) => {
+                                            if let Err(e) = buf_writer.write_all(response.as_bytes()).await {
+                                                warn!("[UDS-RPC] Failed to write response: {}", e);
+                                                break;
                                             }
-                                            None => {
-                                                // No response for notifications
-                                                if let Err(e) = stream.write_all(b"\n").await {
-                                                    warn!("Failed to write newline: {}", e);
-                                                    return;
-                                                }
+                                        }
+                                        None => {
+                                            // For notifications, still send empty response to maintain protocol
+                                            if let Err(e) = buf_writer.write_all(b"{}").await {
+                                                warn!("[UDS-RPC] Failed to write notification response: {}", e);
+                                                break;
                                             }
                                         }
                                     }
+                                    
+                                    // Always send newline and flush
+                                    if let Err(e) = buf_writer.write_all(b"\n").await {
+                                        warn!("[UDS-RPC] Failed to write newline: {}", e);
+                                        break;
+                                    }
+                                    if let Err(e) = buf_writer.flush().await {
+                                        warn!("[UDS-RPC] Failed to flush response: {}", e);
+                                        break;
+                                    }
                                 }
                                 Err(e) => {
-                                    warn!("Error reading from Unix socket: {}", e);
+                                    warn!("[UDS-RPC] Error reading from Unix socket: {}", e);
                                     break;
                                 }
                             }
@@ -1202,7 +1202,7 @@ impl JsonRpcService {
                     });
                 }
                 Ok(Err(e)) => {
-                    warn!("Failed to accept native Unix socket connection: {}", e);
+                    warn!("[UDS-RPC] Failed to accept native Unix socket connection: {}", e);
                 }
                 Err(_) => {
                     // Timeout occurred, continue loop to check exit condition
