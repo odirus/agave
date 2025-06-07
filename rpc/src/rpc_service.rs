@@ -180,7 +180,6 @@ use {
 #[cfg(unix)]
 use {
     std::os::unix::fs::PermissionsExt,
-    tokio::net::UnixListener,
 };
 
 const FULL_SNAPSHOT_REQUEST_PATH: &str = "/snapshot.tar.bz2";
@@ -236,6 +235,7 @@ pub struct JsonRpcService {
     pub request_processor: JsonRpcRequestProcessor, // Used only by test_rpc_new()...
 
     close_handle: Option<CloseHandle>,
+    exit: Arc<AtomicBool>,
     #[cfg(unix)]
     unix_cleanup: Option<Box<dyn FnOnce() + Send>>,
 }
@@ -926,6 +926,9 @@ impl JsonRpcService {
         #[cfg(unix)]
         let socket_path_for_cleanup = unix_socket_path.clone();
         
+        // Clone exit for use in the service thread
+        let exit_for_service = exit.clone();
+        
         let (close_handle_sender, close_handle_receiver) = unbounded();
         let thread_hdl = Builder::new()
             .name("solJsonRpcSvc".to_string())
@@ -949,29 +952,27 @@ impl JsonRpcService {
                     health.clone(),
                 );
 
-                // Start Unix socket server if configured
+                                // Start Native Unix socket server if configured
                 #[cfg(unix)]
                 if let Some(socket_path) = unix_socket_path.clone() {
                     let unix_io = io.clone();
                     let unix_request_processor = request_processor.clone();
-                    let unix_request_middleware = request_middleware.clone();
-                    let unix_exit = exit.clone();
+                    let unix_exit = exit_for_service.clone();
                     let unix_runtime = runtime.clone();
                     
+                    // Start Native Unix Socket server
                     std::thread::spawn(move || {
                         let result = unix_runtime.block_on(async move {
-                            Self::start_unix_socket_server(
+                            Self::start_native_unix_socket_server(
                                 socket_path,
                                 unix_io,
                                 unix_request_processor,
-                                unix_request_middleware,
-                                max_request_body_size,
                                 unix_exit,
                             ).await
                         });
                         
                         if let Err(e) = result {
-                            warn!("Unix socket RPC service error: {:?}", e);
+                            warn!("Native Unix socket RPC service error: {:?}", e);
                         }
                     });
                 }
@@ -1014,11 +1015,10 @@ impl JsonRpcService {
                     close_handle_sender.send(Ok(server.close_handle())).unwrap();
                     server.wait();
                 } else {
-                    // If only Unix socket is configured, we need to keep the thread alive
+                    // If only Unix socket is configured, create a minimal close handle and keep the thread alive
                     #[cfg(unix)]
                     if unix_socket_path.is_some() {
-                        // For Unix socket only mode, we need to provide a fake close handle
-                        // Create a minimal server to get a close handle then immediately shut it down
+                        // For Unix socket only mode, create a minimal dummy server just to get a close handle
                         let dummy_addr = std::net::SocketAddr::from(([127, 0, 0, 1], 0));
                         let dummy_server = ServerBuilder::with_meta_extractor(
                             io.clone(),
@@ -1031,19 +1031,18 @@ impl JsonRpcService {
                         match dummy_server {
                             Ok(server) => {
                                 let handle = server.close_handle();
-                                close_handle_sender.send(Ok(handle.clone())).unwrap();
-                                handle.close(); // Close the dummy server after sending the handle
+                                close_handle_sender.send(Ok(handle)).unwrap();
+                                // Keep the server running but close it when exit is signaled
+                                while !exit_for_service.load(Ordering::Relaxed) {
+                                    std::thread::sleep(std::time::Duration::from_millis(100));
+                                }
+                                server.close();
                             }
                             Err(_) => {
                                 // If we can't create a dummy server, send error
                                 close_handle_sender.send(Err("Cannot create close handle for Unix socket only mode".to_string())).unwrap();
                                 return;
                             }
-                        }
-                        
-                        // Keep the thread running until exit is signaled
-                        while !exit.load(Ordering::Relaxed) {
-                            std::thread::sleep(std::time::Duration::from_millis(100));
                         }
                     } else {
                         close_handle_sender.send(Err("No RPC endpoints configured".to_string())).unwrap();
@@ -1064,6 +1063,7 @@ impl JsonRpcService {
         #[cfg(unix)]
         let unix_cleanup = if let Some(path) = socket_path_for_cleanup {
             Some(Box::new(move || {
+                // Clean up Native Unix Socket file
                 if path.exists() {
                     let _ = std::fs::remove_file(&path);
                 }
@@ -1085,12 +1085,16 @@ impl JsonRpcService {
             #[cfg(test)]
             request_processor: test_request_processor,
             close_handle: Some(close_handle),
+            exit: exit.clone(),
             #[cfg(unix)]
             unix_cleanup,
         })
     }
 
     pub fn exit(&mut self) {
+        // Set the exit flag to signal all threads to stop
+        self.exit.store(true, Ordering::Relaxed);
+        
         if let Some(c) = self.close_handle.take() {
             c.close()
         }
@@ -1106,17 +1110,16 @@ impl JsonRpcService {
         self.thread_hdl.join()
     }
 
+
+
     #[cfg(unix)]
-    async fn start_unix_socket_server(
+    async fn start_native_unix_socket_server(
         socket_path: PathBuf,
         io: MetaIoHandler<JsonRpcRequestProcessor>,
         request_processor: JsonRpcRequestProcessor,
-        request_middleware: RpcRequestMiddleware,
-        max_request_body_size: usize,
         exit: Arc<AtomicBool>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        use hyper::service::service_fn;
-        use hyper::{Body, Request};
+        use tokio::net::UnixListener;
         use tokio::time::{timeout, Duration};
         
         // Remove existing socket file if it exists
@@ -1130,45 +1133,76 @@ impl JsonRpcService {
         // Set socket permissions (readable/writable by owner and group)
         std::fs::set_permissions(&socket_path, std::fs::Permissions::from_mode(0o660))?;
         
-        info!("Unix socket RPC server listening on: {:?}", socket_path);
+        info!("Native Unix socket RPC server listening on: {:?}", socket_path);
         
         // Handle incoming connections with exit condition
         loop {
             // Check exit condition
             if exit.load(Ordering::Relaxed) {
-                info!("Unix socket RPC server shutting down");
+                info!("Native Unix socket RPC server shutting down");
                 break;
             }
             
             // Accept connections with timeout to allow periodic exit checks
             match timeout(Duration::from_millis(100), listener.accept()).await {
-                Ok(Ok((stream, _))) => {
+                Ok(Ok((mut stream, _))) => {
                     let io = io.clone();
                     let request_processor = request_processor.clone();
-                    let request_middleware = request_middleware.clone();
                     
                     tokio::spawn(async move {
-                        let service = service_fn(move |req: Request<Body>| {
-                            let io = io.clone();
-                            let request_processor = request_processor.clone();
-                            let request_middleware = request_middleware.clone();
-                            
-                            async move {
-                                Self::handle_unix_request(req, io, request_processor, request_middleware, max_request_body_size).await
-                            }
-                        });
+                        use tokio::io::{AsyncReadExt, AsyncWriteExt};
                         
-                        // Use hyper to serve HTTP over the Unix socket
-                        if let Err(e) = hyper::server::conn::Http::new()
-                            .serve_connection(stream, service)
-                            .await
-                        {
-                            warn!("Error serving Unix socket connection: {}", e);
+                        let mut buffer = [0; 4096];
+                        let mut accumulated_data = String::new();
+                        
+                        loop {
+                            match stream.read(&mut buffer).await {
+                                Ok(0) => break, // EOF
+                                Ok(n) => {
+                                    let data = String::from_utf8_lossy(&buffer[..n]);
+                                    accumulated_data.push_str(&data);
+                                    
+                                    // Process complete lines
+                                    while let Some(newline_pos) = accumulated_data.find('\n') {
+                                        let line = accumulated_data[..newline_pos].trim().to_string();
+                                        accumulated_data.drain(..=newline_pos);
+                                        
+                                        if line.is_empty() {
+                                            continue;
+                                        }
+                                        
+                                        // Process JSON-RPC request directly
+                                        match io.handle_request_sync(&line, request_processor.clone()) {
+                                            Some(response) => {
+                                                if let Err(e) = stream.write_all(response.as_bytes()).await {
+                                                    warn!("Failed to write response: {}", e);
+                                                    return;
+                                                }
+                                                if let Err(e) = stream.write_all(b"\n").await {
+                                                    warn!("Failed to write newline: {}", e);
+                                                    return;
+                                                }
+                                            }
+                                            None => {
+                                                // No response for notifications
+                                                if let Err(e) = stream.write_all(b"\n").await {
+                                                    warn!("Failed to write newline: {}", e);
+                                                    return;
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    warn!("Error reading from Unix socket: {}", e);
+                                    break;
+                                }
+                            }
                         }
                     });
                 }
                 Ok(Err(e)) => {
-                    warn!("Failed to accept Unix socket connection: {}", e);
+                    warn!("Failed to accept native Unix socket connection: {}", e);
                 }
                 Err(_) => {
                     // Timeout occurred, continue loop to check exit condition
@@ -1179,119 +1213,7 @@ impl JsonRpcService {
         
         Ok(())
     }
-    
-    #[cfg(unix)]
-    async fn handle_unix_request(
-        req: hyper::Request<hyper::Body>,
-        io: MetaIoHandler<JsonRpcRequestProcessor>,
-        request_processor: JsonRpcRequestProcessor,
-        request_middleware: RpcRequestMiddleware,
-        max_request_body_size: usize,
-    ) -> Result<hyper::Response<hyper::Body>, std::convert::Infallible> {
-        use hyper::{Body, StatusCode};
-        
-        // Apply request middleware first
-        match request_middleware.on_request(req) {
-            RequestMiddlewareAction::Respond { response, .. } => {
-                return match response.await {
-                    Ok(resp) => Ok(resp),
-                    Err(_) => Ok(hyper::Response::builder()
-                        .status(StatusCode::INTERNAL_SERVER_ERROR)
-                        .body(Body::from("Internal server error"))
-                        .unwrap()),
-                };
-            }
-            RequestMiddlewareAction::Proceed { request, .. } => {
-                return Self::handle_jsonrpc_request(request, io, request_processor, max_request_body_size).await;
-            }
-        }
-    }
-    
-    #[cfg(unix)]
-    async fn handle_jsonrpc_request(
-        req: hyper::Request<hyper::Body>,
-        io: MetaIoHandler<JsonRpcRequestProcessor>,
-        request_processor: JsonRpcRequestProcessor,
-        max_request_body_size: usize,
-    ) -> Result<hyper::Response<hyper::Body>, std::convert::Infallible> {
-        use hyper::{Body, Method, StatusCode};
-        
-        match req.method() {
-            &Method::POST => {
-                // Check content length
-                if let Some(content_length) = req.headers().get(hyper::header::CONTENT_LENGTH) {
-                    if let Ok(length_str) = content_length.to_str() {
-                        if let Ok(length) = length_str.parse::<usize>() {
-                            if length > max_request_body_size {
-                                return Ok(hyper::Response::builder()
-                                    .status(StatusCode::PAYLOAD_TOO_LARGE)
-                                    .body(Body::from("Request body too large"))
-                                    .unwrap());
-                            }
-                        }
-                    }
-                }
-                
-                // Get request body
-                let body_bytes = match hyper::body::to_bytes(req.into_body()).await {
-                    Ok(bytes) => bytes,
-                    Err(_) => {
-                        return Ok(hyper::Response::builder()
-                            .status(StatusCode::BAD_REQUEST)
-                            .body(Body::from("Failed to read request body"))
-                            .unwrap());
-                    }
-                };
-                
-                let body_str = match std::str::from_utf8(&body_bytes) {
-                    Ok(s) => s,
-                    Err(_) => {
-                        return Ok(hyper::Response::builder()
-                            .status(StatusCode::BAD_REQUEST)
-                            .body(Body::from("Invalid UTF-8 in request body"))
-                            .unwrap());
-                    }
-                };
-                
-                // Handle JSON-RPC request
-                match io.handle_request_sync(body_str, request_processor) {
-                    Some(response) => {
-                        Ok(hyper::Response::builder()
-                            .status(StatusCode::OK)
-                            .header("Content-Type", "application/json")
-                            .header("Access-Control-Allow-Origin", "*")
-                            .header("Access-Control-Allow-Headers", "Content-Type")
-                            .header("Access-Control-Allow-Methods", "POST, GET, OPTIONS")
-                            .body(Body::from(response))
-                            .unwrap())
-                    }
-                    None => {
-                        Ok(hyper::Response::builder()
-                            .status(StatusCode::OK)
-                            .body(Body::empty())
-                            .unwrap())
-                    }
-                }
-            }
-            &Method::OPTIONS => {
-                // Handle CORS preflight
-                Ok(hyper::Response::builder()
-                    .status(StatusCode::OK)
-                    .header("Access-Control-Allow-Origin", "*")
-                    .header("Access-Control-Allow-Headers", "Content-Type")
-                    .header("Access-Control-Allow-Methods", "POST, GET, OPTIONS")
-                    .header("Access-Control-Max-Age", "86400")
-                    .body(Body::empty())
-                    .unwrap())
-            }
-            _ => {
-                Ok(hyper::Response::builder()
-                    .status(StatusCode::METHOD_NOT_ALLOWED)
-                    .body(Body::from("Method not allowed"))
-                    .unwrap())
-            }
-        }
-    }
+
 }
 
 pub fn service_runtime(
