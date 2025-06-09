@@ -51,6 +51,27 @@ fn test_native_unix_socket(socket_path: &Path, request: &str) -> Result<(String,
     Ok((response.trim().to_string(), elapsed))
 }
 
+// 1. Native Unix Socket test with connection reuse - 复用连接版本
+fn test_native_unix_socket_reuse(stream: &mut UnixStream, request: &str) -> Result<(String, u128), Box<dyn std::error::Error>> {
+    use std::io::BufRead;
+    use std::io::BufReader;
+    
+    let start_time = get_time_micros();
+    
+    // 发送原始JSON-RPC数据（无HTTP头）
+    stream.write_all(request.as_bytes())?;
+    stream.write_all(b"\n")?; // 添加换行符作为消息分隔符
+    
+    // 读取一行响应（服务器以换行符结束响应）
+    let mut reader = BufReader::new(stream);
+    let mut response = String::new();
+    reader.read_line(&mut response)?;
+    
+    let elapsed = get_time_micros() - start_time;
+    
+    Ok((response.trim().to_string(), elapsed))
+}
+
 // 2. HTTP over TCP test
 async fn test_http_tcp(client: &hyper::Client<hyper::client::HttpConnector>, url: &str, request: &Value) -> Result<(String, u128), Box<dyn std::error::Error>> {
     let start_time = get_time_micros();
@@ -122,9 +143,11 @@ async fn run_comprehensive_benchmark(method: &str, params: Value, iterations: us
     // 结果存储
     let mut http_tcp_times = Vec::new();
     let mut native_unix_times = Vec::new();
+    let mut native_unix_reuse_times = Vec::new();
     
     let mut http_tcp_success = 0;
     let mut native_unix_success = 0;
+    let mut native_unix_reuse_success = 0;
     
     println!("📡 Testing HTTP over TCP (127.0.0.1:8899)...");
     // 预热
@@ -161,7 +184,7 @@ async fn run_comprehensive_benchmark(method: &str, params: Value, iterations: us
 
     
     if native_unix_socket.exists() {
-        println!("⚡ Testing Native Unix Socket (/tmp/solana-rpc.sock)...");
+        println!("⚡ Testing Native Unix Socket - New Connection Per Request (/tmp/solana-rpc.sock)...");
         
         // 正式测试（原生Unix Socket不需要太多预热）
         for i in 0..iterations {
@@ -188,52 +211,131 @@ async fn run_comprehensive_benchmark(method: &str, params: Value, iterations: us
                 std::thread::sleep(std::time::Duration::from_millis(1));
             }
         }
+
+        println!("🚀 Testing Native Unix Socket - Connection Reuse (/tmp/solana-rpc.sock)...");
+        
+        // 测试连接复用版本
+        match UnixStream::connect(native_unix_socket) {
+            Ok(mut reuse_stream) => {
+                for i in 0..iterations {
+                    match test_native_unix_socket_reuse(&mut reuse_stream, &request_str) {
+                        Ok((response, elapsed)) => {
+                            native_unix_reuse_times.push(elapsed);
+                            native_unix_reuse_success += 1;
+                            if i == 0 {
+                                if let Ok(json_response) = serde_json::from_str::<Value>(&response) {
+                                    if let Some(result) = json_response.get("result") {
+                                        println!("   ✅ Response: {}", serde_json::to_string_pretty(result)?);
+                                    }
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            if i == 0 {
+                                println!("   ❌ Native Unix Socket (reuse) failed: {}", e);
+                            }
+                            // 连接断开，尝试重新连接
+                            if let Ok(new_stream) = UnixStream::connect(native_unix_socket) {
+                                reuse_stream = new_stream;
+                            } else {
+                                break;
+                            }
+                        }
+                    }
+                    
+                    if i % 50 == 0 && i > 0 {
+                        std::thread::sleep(std::time::Duration::from_millis(1));
+                    }
+                }
+            }
+            Err(e) => {
+                println!("   ❌ Failed to create reusable Unix Socket connection: {}", e);
+            }
+        }
     } else {
         println!("⚠️  Native Unix Socket not available at: {:?}", native_unix_socket);
     }
     
     // 打印详细统计结果
     println!("\n📊 Comprehensive Performance Analysis:");
-    println!("{}", "-".repeat(80));
+    println!("{}", "-".repeat(90));
     
     if http_tcp_success > 0 {
         let (avg, min, max, std, median) = calculate_stats(&http_tcp_times);
-        println!("HTTP/TCP     | Avg: {:>7.1}μs | Med: {:>7.1}μs | Min: {:>6}μs | Max: {:>6}μs | Std: {:>6.1}μs | {}/{}", 
+        println!("HTTP/TCP (reuse)      | Avg: {:>7.1}μs | Med: {:>7.1}μs | Min: {:>6}μs | Max: {:>6}μs | Std: {:>6.1}μs | {}/{}", 
             avg, median, min, max, std, http_tcp_success, iterations);
     } else {
-        println!("HTTP/TCP     | ❌ All requests failed");
+        println!("HTTP/TCP (reuse)      | ❌ All requests failed");
     }
     
     if native_unix_success > 0 {
         let (avg, min, max, std, median) = calculate_stats(&native_unix_times);
-        println!("Native/Unix  | Avg: {:>7.1}μs | Med: {:>7.1}μs | Min: {:>6}μs | Max: {:>6}μs | Std: {:>6.1}μs | {}/{}", 
+        println!("Unix/Socket (new)     | Avg: {:>7.1}μs | Med: {:>7.1}μs | Min: {:>6}μs | Max: {:>6}μs | Std: {:>6.1}μs | {}/{}", 
             avg, median, min, max, std, native_unix_success, iterations);
     } else {
-        println!("Native/Unix  | ❌ All requests failed");
+        println!("Unix/Socket (new)     | ❌ All requests failed");
+    }
+
+    if native_unix_reuse_success > 0 {
+        let (avg, min, max, std, median) = calculate_stats(&native_unix_reuse_times);
+        println!("Unix/Socket (reuse)   | Avg: {:>7.1}μs | Med: {:>7.1}μs | Min: {:>6}μs | Max: {:>6}μs | Std: {:>6.1}μs | {}/{}", 
+            avg, median, min, max, std, native_unix_reuse_success, iterations);
+    } else {
+        println!("Unix/Socket (reuse)   | ❌ All requests failed");
     }
     
     // 性能比较
+    println!("{}", "-".repeat(90));
     if http_tcp_success > 0 && native_unix_success > 0 {
         let (http_tcp_avg, _, _, _, _) = calculate_stats(&http_tcp_times);
         let (native_unix_avg, _, _, _, _) = calculate_stats(&native_unix_times);
         
-        println!("{}", "-".repeat(80));
         let speedup = http_tcp_avg / native_unix_avg;
         let improvement = ((http_tcp_avg - native_unix_avg) / http_tcp_avg) * 100.0;
         
         if speedup > 1.1 {
-            println!("🏆 Native Unix Socket is {:.2}x faster than HTTP/TCP ({:.1}% improvement)", speedup, improvement);
+            println!("🔄 Unix Socket (new conn) vs HTTP/TCP: {:.2}x faster ({:.1}% improvement)", speedup, improvement);
         } else if speedup < 0.9 {
-            println!("📈 HTTP/TCP is {:.2}x faster than Native Unix Socket ({:.1}% better)", 1.0/speedup, -improvement);
+            println!("🔄 HTTP/TCP vs Unix Socket (new conn): {:.2}x faster ({:.1}% better)", 1.0/speedup, -improvement);
         } else {
-            println!("⚖️  Native Unix Socket and HTTP/TCP have similar performance (difference: {:.1}%)", improvement.abs());
+            println!("⚖️  Unix Socket (new conn) and HTTP/TCP have similar performance (difference: {:.1}%)", improvement.abs());
+        }
+    }
+
+    if http_tcp_success > 0 && native_unix_reuse_success > 0 {
+        let (http_tcp_avg, _, _, _, _) = calculate_stats(&http_tcp_times);
+        let (native_unix_reuse_avg, _, _, _, _) = calculate_stats(&native_unix_reuse_times);
+        
+        let speedup = http_tcp_avg / native_unix_reuse_avg;
+        let improvement = ((http_tcp_avg - native_unix_reuse_avg) / http_tcp_avg) * 100.0;
+        
+        if speedup > 1.1 {
+            println!("🏆 Unix Socket (reuse) vs HTTP/TCP: {:.2}x faster ({:.1}% improvement)", speedup, improvement);
+        } else if speedup < 0.9 {
+            println!("📈 HTTP/TCP vs Unix Socket (reuse): {:.2}x faster ({:.1}% better)", 1.0/speedup, -improvement);
+        } else {
+            println!("⚖️  Unix Socket (reuse) and HTTP/TCP have similar performance (difference: {:.1}%)", improvement.abs());
+        }
+    }
+
+    if native_unix_success > 0 && native_unix_reuse_success > 0 {
+        let (native_unix_avg, _, _, _, _) = calculate_stats(&native_unix_times);
+        let (native_unix_reuse_avg, _, _, _, _) = calculate_stats(&native_unix_reuse_times);
+        
+        let speedup = native_unix_avg / native_unix_reuse_avg;
+        let improvement = ((native_unix_avg - native_unix_reuse_avg) / native_unix_avg) * 100.0;
+        
+        if speedup > 1.1 {
+            println!("💫 Connection reuse impact: {:.2}x faster ({:.1}% improvement)", speedup, improvement);
+        } else {
+            println!("🤔 Connection reuse shows minimal impact (difference: {:.1}%)", improvement.abs());
         }
     }
     
     // 百分位数分析
-    if native_unix_success > 10 && http_tcp_success > 10 {
+    if native_unix_reuse_success > 10 && http_tcp_success > 10 {
         println!("\n📈 Percentile Analysis:");
-        println!("             | P50     | P95     | P99");
+        println!("                      | P50     | P95     | P99");
         
         if http_tcp_success > 10 {
             let mut sorted = http_tcp_times.clone();
@@ -241,7 +343,7 @@ async fn run_comprehensive_benchmark(method: &str, params: Value, iterations: us
             let p50 = sorted[sorted.len() * 50 / 100];
             let p95 = sorted[sorted.len() * 95 / 100];
             let p99 = sorted[sorted.len() * 99 / 100];
-            println!("HTTP/TCP     | {:>6}μs | {:>6}μs | {:>6}μs", p50, p95, p99);
+            println!("HTTP/TCP (reuse)      | {:>6}μs | {:>6}μs | {:>6}μs", p50, p95, p99);
         }
         
         if native_unix_success > 10 {
@@ -250,7 +352,16 @@ async fn run_comprehensive_benchmark(method: &str, params: Value, iterations: us
             let p50 = sorted[sorted.len() * 50 / 100];
             let p95 = sorted[sorted.len() * 95 / 100];
             let p99 = sorted[sorted.len() * 99 / 100];
-            println!("Native/Unix  | {:>6}μs | {:>6}μs | {:>6}μs", p50, p95, p99);
+            println!("Unix/Socket (new)     | {:>6}μs | {:>6}μs | {:>6}μs", p50, p95, p99);
+        }
+
+        if native_unix_reuse_success > 10 {
+            let mut sorted = native_unix_reuse_times.clone();
+            sorted.sort();
+            let p50 = sorted[sorted.len() * 50 / 100];
+            let p95 = sorted[sorted.len() * 95 / 100];
+            let p99 = sorted[sorted.len() * 99 / 100];
+            println!("Unix/Socket (reuse)   | {:>6}μs | {:>6}μs | {:>6}μs", p50, p95, p99);
         }
     }
     
@@ -290,14 +401,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     
     println!("\n✨ Comprehensive performance testing completed!");
-    println!("\n💡 Performance Expectations:");
-    println!("   • Native Unix Socket should be 2-5x faster than HTTP/TCP");
-    println!("   • Benefits: Skip HTTP parsing, avoid TCP/IP stack, direct IPC");
+    println!("\n💡 Performance Analysis Guide:");
+    println!("   • HTTP/TCP (reuse): Uses connection pooling - most realistic");
+    println!("   • Unix Socket (new): Creates new connection per request");
+    println!("   • Unix Socket (reuse): Fair comparison with HTTP connection reuse");
+    println!("   • Connection reuse should show significant improvement for Unix sockets");
     
-    println!("\n🎯 If Native Unix Socket isn't significantly faster:");
+    println!("\n🎯 Expected Results:");
+    println!("   • Unix Socket (reuse) should be 2-5x faster than HTTP/TCP");
+    println!("   • Unix Socket (new) may be slower due to connection overhead");
+    println!("   • Connection reuse impact shows the cost of socket creation");
+    
+    println!("\n🔍 If results are unexpected:");
     println!("   • Check if both servers are actually running");
     println!("   • Verify that /tmp/solana-rpc.sock exists");
-    println!("   • Consider connection establishment overhead");
+    println!("   • Connection establishment overhead varies by system");
     println!("   • JSON parsing might be the bottleneck, not transport");
     
     Ok(())
